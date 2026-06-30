@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bayesian-mlx"
+version = "0.1.0"
+description = "Batched multi-chain HMC and NUTS samplers on Apple's MLX framework"
+requires-python = ">=3.9"
+dependencies = ["mlx", "numpy"]
+
+[project.optional-dependencies]
+# Used only by the examples (PyMC NUTS reference, plotting, ArviZ summaries).
+examples = ["pymc", "arviz", "matplotlib"]
+
+[tool.setuptools]
+packages = ["blmx"]
