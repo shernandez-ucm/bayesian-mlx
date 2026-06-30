@@ -21,11 +21,20 @@ path length with the adaptive No-U-Turn termination of "Algorithm 6" of Hoffman 
 Gelman (2014), using the multinomial/biased-progressive trajectory sampling and
 generalized U-turn criterion of Betancourt (2017).
 
-Because MLX uses ordinary Python control flow (no graph-tracing JIT constrains
-the trajectory), it is built by **recursive doubling** -- the natural,
-checkpoint-free formulation. The recursion depth is bounded by ``max_treedepth``,
-and chains that U-turn or diverge early are *masked off* so the remaining chains
-keep doubling; the outer loop stops once every chain has terminated.
+Each new half of the trajectory (a depth-``d`` subtree, ``2 ** d`` leapfrog
+leaves) is built by **NumPyro's "Iterative NUTS"** scheme
+(https://github.com/pyro-ppl/numpyro/wiki/Iterative-NUTS) rather than recursion:
+leaves are taken one leapfrog step at a time in a flat loop, folded into a
+running subtree with a weighted-reservoir combine, while an explicit checkpoint
+stack of size ``d`` (indexed with the same popcount/trailing-ones bit tricks as
+NumPyro) reproduces every generalized-U-turn check that bottom-up recursive
+doubling would perform at each aligned power-of-two sub-interval. MLX's eager
+execution makes this simpler than the JAX original: the leaf index is a
+concrete Python loop counter, so the checkpoint stack is a plain Python list
+indexed with plain integers -- no on-device dynamic-index array updates needed.
+The outer doubling loop (depth 0, 1, 2, ...) is unchanged: chains that U-turn or
+diverge are *masked off* so the remaining chains keep doubling, and the outer
+loop stops once every chain has terminated.
 
 It shares ``hmc_mlx``'s conventions exactly and reuses its helpers:
 
@@ -144,13 +153,21 @@ def _edge(tree, going_right):
     return z, r, grad
 
 
-def _combine(cur, new, var, going_right, key, biased):
+def _combine(cur, new, var, going_right, key, biased, check_turning=True):
     """Merge ``new`` into ``cur`` in each chain's doubling direction.
 
     Outer boundaries come from whichever subtree is on each side. The proposal is
     resampled with a biased kernel between main trees (favouring the fresh half)
-    and a uniform (multinomial) kernel within a subtree, matching NumPyro. The
-    combined ``turning`` flag includes the cross-subtree generalized U-turn.
+    and a uniform (multinomial) kernel within a subtree, matching NumPyro.
+
+    ``check_turning`` adds the cross-subtree generalized U-turn between the
+    merged left/right boundaries to ``turning``. This is only a valid NUTS
+    termination check when ``cur`` and ``new`` are equal-size, properly aligned
+    halves (the outer doubling combine). The iterative leaf-by-leaf subtree
+    fold in :func:`_build_subtree` combines a running (generally unaligned)
+    prefix with a single new leaf, so it passes ``check_turning=False`` and
+    instead performs the generalized U-turn check explicitly via the
+    checkpoint stack (matching NumPyro's "Iterative NUTS").
     """
     z_left, r_left, grad_left = _where_tree(
         going_right, cur.z_left, new.z_left), _where_tree(
@@ -163,8 +180,11 @@ def _combine(cur, new, var, going_right, key, biased):
 
     r_sum = _tree_add(cur.r_sum, new.r_sum)
     weight = mx.logaddexp(cur.weight, new.weight)
-    cross_turning = _is_turning(r_left, r_right, r_sum, var)
-    turning = cur.turning | new.turning | cross_turning
+    if check_turning:
+        cross_turning = _is_turning(r_left, r_right, r_sum, var)
+        turning = cur.turning | new.turning | cross_turning
+    else:
+        turning = cur.turning | new.turning
     diverging = cur.diverging | new.diverging
 
     if biased:
@@ -185,29 +205,79 @@ def _combine(cur, new, var, going_right, key, biased):
     )
 
 
+def _leaf_idx_to_ckpt_idxs(n):
+    """Map leaf index ``n`` (0-based within a subtree) to the inclusive range of
+    checkpoint slots that must be checked for a U-turn after leaf ``n`` is built.
+
+    Pure-Python bit trick from NumPyro's "Iterative NUTS"
+    (https://github.com/pyro-ppl/numpyro/wiki/Iterative-NUTS); ``n`` is a
+    concrete loop counter under MLX's eager execution, so this needs no
+    on-device bitwise ops, unlike the JAX original.
+
+    Bit ``i`` of ``n`` (from the LSB, excluding bit 0) is 1 iff this leaf is the
+    right child of the depth-``(i + 1)`` ancestor subtree; ``idx_max`` counts
+    those set bits -- how many enclosing checkpoints are currently open.
+    ``num_subtrees`` is the run of trailing 1-bits in ``n`` -- how many of the
+    most-recently-opened checkpoints this leaf just closes by completing their
+    right half. For even ``n`` this run is always empty (``idx_min > idx_max``):
+    even leaves only ever *open* a new checkpoint, never close one.
+    """
+    idx_max = bin(n >> 1).count("1")
+    m = n + 1
+    num_subtrees = (m & -m).bit_length() - 1  # trailing 1-bits of n == trailing 0-bits of n+1
+    idx_min = idx_max - num_subtrees + 1
+    return idx_min, idx_max
+
+
 def _build_subtree(batched_ldf, z, r, grad, var, signed_step, going_right,
                    depth, energy0, Emax, key):
-    """Recursively build a balanced subtree of ``2 ** depth`` leaves from one edge.
+    """Iteratively build a subtree of ``2 ** depth`` leaves from one edge.
 
-    Depth 0 is a single leapfrog leaf; deeper trees combine two same-depth halves
-    built in sequence (the second from the far edge of the first), checking the
-    generalized U-turn as they merge. All chains are built to full depth; the
-    per-chain ``turning`` / ``diverging`` flags carry which ones should stop.
+    NumPyro's "Iterative NUTS" (https://github.com/pyro-ppl/numpyro/wiki/Iterative-NUTS),
+    adapted to per-chain batching. Leaves are taken one leapfrog step at a time
+    in a flat loop (no recursion) and folded into a running subtree with a
+    weighted-reservoir combine (``biased=False``); this combine is associative
+    regardless of grouping, so folding leaves in one at a time gives the same
+    multinomial proposal distribution as the old pairwise-doubling recursion.
+
+    The combine's own cross-subtree check is skipped (``check_turning=False``)
+    because the running fold is, in general, *not* an aligned power-of-two
+    block -- checking it would test a non-canonical sub-interval. Instead an
+    explicit checkpoint stack of size ``depth`` (a plain Python list, since the
+    leaf index is a concrete loop counter) reproduces every U-turn check the
+    bottom-up recursive doubling would perform at each aligned sub-interval:
+    on even leaves a checkpoint is opened (its momentum and running ``r_sum``
+    stored); on odd leaves every checkpoint the new leaf closes is checked
+    against the leaf via the generalized U-turn criterion.
     """
-    if depth == 0:
-        return _base_tree(batched_ldf, z, r, grad, var, signed_step, energy0, Emax)
+    # A depth-0 subtree (the first doubling) still opens one checkpoint slot
+    # for its single leaf (n=0 is even), even though nothing in this call ever
+    # reads it back (there is no n=1) -- so the stack needs at least size 1.
+    r_ckpts = [None] * max(depth, 1)
+    r_sum_ckpts = [None] * max(depth, 1)
 
-    k_left, k_right, k_comb = mx.random.split(key, 3)
-    left = _build_subtree(
-        batched_ldf, z, r, grad, var, signed_step, going_right,
-        depth - 1, energy0, Emax, k_left,
-    )
-    z2, r2, grad2 = _edge(left, going_right)
-    right = _build_subtree(
-        batched_ldf, z2, r2, grad2, var, signed_step, going_right,
-        depth - 1, energy0, Emax, k_right,
-    )
-    return _combine(left, right, var, going_right, k_comb, biased=False)
+    cur = None
+    for n in range(1 << depth):
+        key, k_comb = mx.random.split(key)
+        new_leaf = _base_tree(batched_ldf, z, r, grad, var, signed_step, energy0, Emax)
+        cur = new_leaf if cur is None else _combine(
+            cur, new_leaf, var, going_right, k_comb, biased=False, check_turning=False,
+        )
+
+        idx_min, idx_max = _leaf_idx_to_ckpt_idxs(n)
+        if n % 2 == 0:
+            r_ckpts[idx_max] = new_leaf.r_right
+            r_sum_ckpts[idx_max] = cur.r_sum
+        else:
+            leaf_turning = mx.zeros_like(energy0) > 0
+            for i in range(idx_min, idx_max + 1):
+                subtree_r_sum = _tree_sub(_tree_add(cur.r_sum, r_ckpts[i]), r_sum_ckpts[i])
+                leaf_turning = leaf_turning | _is_turning(r_ckpts[i], new_leaf.r_right, subtree_r_sum, var)
+            cur.turning = cur.turning | leaf_turning
+
+        z, r, grad = new_leaf.z_right, new_leaf.r_right, new_leaf.grad_right
+
+    return cur
 
 
 def _build_nuts_move(batched_ldf, max_treedepth, Emax):
@@ -290,7 +360,7 @@ def sample_nuts_chains(
     """Sample multiple chains with a batched, on-device NUTS (MLX).
 
     All ``chains`` advance together as the leading array axis. Each draw builds an
-    adaptive No-U-Turn trajectory (recursive doubling, generalized U-turn
+    adaptive No-U-Turn trajectory (iterative tree doubling, generalized U-turn
     termination) instead of a fixed leapfrog path. Warmup tunes a single (shared)
     step size by dual averaging and, if ``adapt_mass`` is True, a diagonal mass
     matrix estimated from the warmup draws; both are then frozen for sampling.

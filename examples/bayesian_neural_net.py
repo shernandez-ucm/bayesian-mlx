@@ -1,4 +1,4 @@
-"""Red neuronal bayesiana de última capa con MLX, contrastada con NUTS de PyMC.
+"""Red neuronal bayesiana (última capa vs red completa) con MLX, usando HMC.
 
 Pipeline del laboratorio:
 
@@ -7,13 +7,13 @@ Pipeline del laboratorio:
    (cabeza heterocedástica: salida = mu, log-varianza y nu de la t). Las colas
    pesadas de la t la hacen robusta a los valores atípicos.
 3. Bayesiano de **última capa**: congelamos el cuerpo en su valor MAP como
-   extractor de características phi(x) y muestreamos SOLO la última capa lineal.
-   Es barato y captura la mayor parte de la incertidumbre epistémica.
-   - con ``blmx.sample_nuts_chains`` (NUTS sobre MLX), y
-   - con el NUTS de **PyMC** sobre el modelo equivalente (mismas características
-     congeladas como datos, misma previa N(0,1), misma verosimilitud t-Student).
-4. Comparamos las métricas predictivas de ambos muestreadores (deben coincidir)
-   frente al MLP determinista, y dibujamos las curvas.
+   extractor de características phi(x) y muestreamos SOLO la última capa lineal
+   con ``blmx.sample_hmc_chains``. Es barato y captura la mayor parte de la
+   incertidumbre epistémica.
+4. Bayesiano de **red completa**: muestreamos TODOS los parámetros (cuerpo +
+   última capa) con HMC-MLX, capturando la incertidumbre epistémica completa.
+5. Comparamos las métricas predictivas y el rendimiento (pasos/seg, grads/paso)
+   de ambos enfoques frente al MLP determinista, y dibujamos las curvas.
 
 Todo el backend numérico es MLX (Apple Silicon); no se usa JAX/distrax/TFP. La t
 de Student se implementa a mano (su constante de normalización necesita lgamma,
@@ -22,6 +22,7 @@ que aproximamos con Lanczos, diferenciable y válido para nu por punto).
 
 import os
 import sys
+import time
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -33,10 +34,26 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_map
 
-from blmx import sample_nuts_chains
+from blmx import sample_hmc_chains
 
 RANDOM_STATE = 42   # semilla única para todo el laboratorio (reproducibilidad)
 PRIOR_SD = 1.0      # previa N(0, PRIOR_SD) sobre los pesos bayesianos
+
+
+class GradientCounter:
+    """Contador de evaluaciones de gradiente para medir eficiencia del muestreador."""
+    def __init__(self):
+        self.count = 0
+
+    def reset(self):
+        self.count = 0
+
+    def wrap(self, logp_dlogp_fn):
+        """Envuelve una función logp_dlogp para contar llamadas."""
+        def counted_logp_dlogp(q):
+            self.count += 1
+            return logp_dlogp_fn(q)
+        return counted_logp_dlogp
 
 
 # ---------------------------------------------------------------------------
@@ -181,7 +198,7 @@ key = mx.random.key(RANDOM_STATE)
 key, k_init = mx.random.split(key)
 params = init_mlp(k_init, [1, 64, 64, 3])
 print("\nEntrenando MLP con pérdida t-Student (SGD)...")
-params = train(tstudent_loss, params, Xtr, ytr, n_epochs=8000, lr=1e-2)
+params = train(tstudent_loss, params, Xtr, ytr, n_epochs=20000, lr=1e-2)
 
 
 # ---------------------------------------------------------------------------
@@ -224,51 +241,94 @@ def log_posterior_last(flat):
 
 # Contrato del backend MLX: q (vector) -> (logp escalar, dlogp); lo batchea el
 # muestreador sobre las cadenas con mx.vmap.
-logp_dlogp_last = mx.value_and_grad(log_posterior_last)
+logp_dlogp_last_base = mx.value_and_grad(log_posterior_last)
 flat0 = mx.concatenate([W_last0.reshape(-1), b_last0])
 
-print("\nMuestreando la última capa con NUTS-MLX (%d parámetros)..." % model_ndim_last)
-trace_mlx, stats_mlx = sample_nuts_chains(
+# Muestrear última capa con HMC-MLX, midiendo rendimiento
+print("\nMuestreando la última capa con HMC-MLX (%d parámetros)..." % model_ndim_last)
+counter_last = GradientCounter()
+logp_dlogp_last = counter_last.wrap(logp_dlogp_last_base)
+t0_last = time.time()
+trace_mlx, stats_mlx = sample_hmc_chains(
     logp_dlogp_last, model_ndim_last,
     draws=500, tune=500, chains=4, target_accept=0.9,
     start=flat0, random_seed=RANDOM_STATE,
 )
+time_last = time.time() - t0_last
 samples_mlx = np.asarray(trace_mlx).reshape(-1, model_ndim_last)
-print("  muestras: %d  |  divergencias: %d" % (samples_mlx.shape[0], int(stats_mlx["diverging"].sum())))
+steps_last = samples_mlx.shape[0]
+grads_per_step_last = counter_last.count / max(steps_last, 1) if steps_last > 0 else 0
+steps_per_sec_last = steps_last / time_last if time_last > 0 else 0
+print("  muestras: %d  |  divergencias: %d" % (steps_last, int(stats_mlx["diverging"].sum())))
+print("  rendimiento: %.1f pasos/seg  |  %.2f grads/paso" % (steps_per_sec_last, grads_per_step_last))
 
 
 # ---------------------------------------------------------------------------
-# 2b) Mismo modelo de última capa, muestreado con el NUTS de PyMC (referencia).
+# 2a) Bayesiano de RED COMPLETA: muestreamos TODOS los parámetros (cuerpo + última capa)
+#     con previa N(0, PRIOR_SD). Comparamos contra el enfoque de última capa.
 # ---------------------------------------------------------------------------
-def sample_pymc_last():
-    import pymc as pm
-    import pytensor.tensor as pt
-
-    phi_np = np.asarray(phi_tr)
-    ytr_np = np.asarray(ytr)
-    with pm.Model():
-        W = pm.Normal("W", 0.0, PRIOR_SD, shape=(H, N_OUT))
-        b = pm.Normal("b", 0.0, PRIOR_SD, shape=N_OUT)
-        out = pt.dot(phi_np, W) + b
-        mu = out[:, 0]
-        sigma = pt.exp(0.5 * pt.clip(out[:, 1], -7.0, 7.0))
-        nu = 2.0 + pt.softplus(out[:, 2])
-        pm.StudentT("y", nu=nu, mu=mu, sigma=sigma, observed=ytr_np)
-        idata = pm.sample(
-            draws=500, tune=500, chains=4, cores=1, target_accept=0.9,
-            random_seed=RANDOM_STATE, progressbar=False,
-        )
-    post = idata.posterior
-    W_s = np.asarray(post["W"]).reshape(-1, H, N_OUT)
-    b_s = np.asarray(post["b"]).reshape(-1, N_OUT)
-    flat = np.concatenate([W_s.reshape(W_s.shape[0], -1), b_s], axis=1)
-    n_div = int(idata.sample_stats["diverging"].values.sum())
-    return flat, n_div
+def flatten_params(params_list):
+    """Concatena todos los parámetros en un vector."""
+    flat_list = []
+    for W, b in params_list:
+        flat_list.append(W.reshape(-1))
+        flat_list.append(b)
+    return mx.concatenate(flat_list)
 
 
-print("\nMuestreando la última capa con NUTS-PyMC (referencia)...")
-samples_pm, n_div_pm = sample_pymc_last()
-print("  muestras: %d  |  divergencias: %d" % (samples_pm.shape[0], n_div_pm))
+def unflatten_params(flat, sizes):
+    """Vector -> lista de pares (W, b) con las formas especificadas."""
+    params_out = []
+    idx = 0
+    for din, dout in zip(sizes[:-1], sizes[1:]):
+        W_size = din * dout
+        W = flat[idx:idx + W_size].reshape(din, dout)
+        b = flat[idx + W_size:idx + W_size + dout]
+        params_out.append([W, b])
+        idx += W_size + dout
+    return params_out
+
+
+def mlp_forward_full(params_flat, sizes, x):
+    """Pasada forward de un MLP desde parámetros aplanados."""
+    params = unflatten_params(params_flat, sizes)
+    for W, b in params[:-1]:
+        x = nn.relu(x @ W + b)
+    W, b = params[-1]
+    return x @ W + b
+
+
+def log_posterior_full(flat):
+    """log-posterior no normalizado sobre TODOS los parámetros de la red."""
+    sizes = [1, 64, 64, 3]
+    out = mlp_forward_full(flat, sizes, Xtr)
+    mu, sigma, nu = predict_params(out)
+    loglik = mx.sum(tstudent_logpdf(ytr, mu, sigma, nu))
+    logprior = -0.5 * mx.sum(flat * flat) / (PRIOR_SD ** 2)
+    return loglik + logprior
+
+
+flat_full0 = flatten_params(params)
+model_ndim_full = flat_full0.size
+
+print("\nMuestreando RED COMPLETA con HMC-MLX (%d parámetros)..." % model_ndim_full)
+logp_dlogp_full_base = mx.value_and_grad(log_posterior_full)
+
+counter_full = GradientCounter()
+logp_dlogp_full = counter_full.wrap(logp_dlogp_full_base)
+t0_full = time.time()
+trace_mlx_full, stats_mlx_full = sample_hmc_chains(
+    logp_dlogp_full, model_ndim_full,
+    draws=500, tune=500, chains=4, target_accept=0.9,
+    start=flat_full0, random_seed=RANDOM_STATE,
+)
+time_full = time.time() - t0_full
+samples_mlx_full = np.asarray(trace_mlx_full).reshape(-1, model_ndim_full)
+steps_full = samples_mlx_full.shape[0]
+grads_per_step_full = counter_full.count / max(steps_full, 1) if steps_full > 0 else 0
+steps_per_sec_full = steps_full / time_full if time_full > 0 else 0
+print("  muestras: %d  |  divergencias: %d" % (steps_full, int(stats_mlx_full["diverging"].sum())))
+print("  rendimiento: %.1f pasos/seg  |  %.2f grads/paso" % (steps_per_sec_full, grads_per_step_full))
 
 
 # ---------------------------------------------------------------------------
@@ -276,6 +336,7 @@ print("  muestras: %d  |  divergencias: %d" % (samples_pm.shape[0], n_div_pm))
 # ---------------------------------------------------------------------------
 yte_real = y_test
 phi_te_np = np.asarray(phi_te)
+Xte_np = np.asarray(Xte)
 
 
 def head_np(flat, phi):
@@ -283,6 +344,31 @@ def head_np(flat, phi):
     W = flat[: H * N_OUT].reshape(H, N_OUT)
     b = flat[H * N_OUT:]
     out = phi @ W + b
+    mu = out[:, 0]
+    sigma = np.exp(0.5 * np.clip(out[:, 1], -7.0, 7.0))
+    nu = 2.0 + np.log1p(np.exp(out[:, 2]))
+    return mu, sigma, nu
+
+
+def predict_full_network_np(flat_params, x_np, sizes):
+    """Predice (mu, sigma, nu) desde parámetros de red completa en numpy."""
+    params = []
+    idx = 0
+    for din, dout in zip(sizes[:-1], sizes[1:]):
+        W_size = din * dout
+        W = flat_params[idx:idx + W_size].reshape(din, dout)
+        b = flat_params[idx + W_size:idx + W_size + dout]
+        params.append([W, b])
+        idx += W_size + dout
+
+    # Forward pass
+    x = x_np
+    for W, b in params[:-1]:
+        x = np.maximum(x @ W + b, 0)  # ReLU
+    W, b = params[-1]
+    out = x @ W + b
+
+    # Parámetros de la t de Student
     mu = out[:, 0]
     sigma = np.exp(0.5 * np.clip(out[:, 1], -7.0, 7.0))
     nu = 2.0 + np.log1p(np.exp(out[:, 2]))
@@ -337,20 +423,46 @@ det_rmse = rmse(det_mu)
 det_ll = float(np.mean(student_t.logpdf(yte_real, df=nu_d, loc=det_mu, scale=sigma_d * y_sd)))
 
 mlx_rmse, mlx_ll, mlx_cov, mlx_crps = bayes_metrics(samples_mlx, RANDOM_STATE)
-pm_rmse, pm_ll, pm_cov, pm_crps = bayes_metrics(samples_pm, RANDOM_STATE + 1)
+
+# Métricas para la red completa
+sizes_full = [1, 64, 64, 3]
+samples_full_np = np.asarray(samples_mlx_full)
+mlx_full_rmse, mlx_full_ll, mlx_full_cov, mlx_full_crps = (
+    float("nan"), float("nan"), float("nan"), float("nan")
+)
+if samples_full_np.shape[0] > 0:
+    rng = np.random.RandomState(RANDOM_STATE)
+    S = samples_full_np.shape[0]
+    mus_full, lps_full, preds_full = [], [], []
+    for flat in samples_full_np:
+        mu, sigma, nu = predict_full_network_np(flat, Xte_np, sizes_full)
+        mu_real = mu * y_sd + y_mean
+        sigma_real = sigma * y_sd
+        mus_full.append(mu_real)
+        lps_full.append(student_t.logpdf(yte_real, df=nu, loc=mu_real, scale=sigma_real))
+        preds_full.append(mu_real + sigma_real * rng.standard_t(nu))
+    mus_full = np.array(mus_full)
+    lps_full = np.array(lps_full)
+    preds_full = np.array(preds_full)
+    from scipy.special import logsumexp
+    mean_mu_full = mus_full.mean(axis=0)
+    mlx_full_rmse = rmse(mean_mu_full)
+    mlx_full_ll = float(np.mean(logsumexp(lps_full, axis=0) - np.log(S)))
+    mlx_full_cov = coverage95(preds_full)
+    mlx_full_crps = crps(preds_full)
 
 print("\n=== Comparación en el conjunto de prueba ===")
-hdr = "%-34s%9s%13s%10s%9s" % ("Modelo", "RMSE", "log-lik/pto", "cob.95%", "CRPS")
+hdr = "%-40s%9s%13s%10s%9s%10s%10s" % ("Modelo", "RMSE", "log-lik/pto", "cob.95%", "CRPS", "paso/seg", "grads/paso")
 print(hdr)
-print("%-34s%9.4f%13.4f%10s%9s" % ("MLP determinista (MAP)", det_rmse, det_ll, "-", "-"))
-print("%-34s%9.4f%13.4f%10.3f%9.4f" % ("Bayes última capa (NUTS-MLX)", mlx_rmse, mlx_ll, mlx_cov, mlx_crps))
-print("%-34s%9.4f%13.4f%10.3f%9.4f" % ("Bayes última capa (NUTS-PyMC)", pm_rmse, pm_ll, pm_cov, pm_crps))
+print("%-40s%9.4f%13.4f%10s%9s%10s%10s" % ("MLP determinista (MAP)", det_rmse, det_ll, "-", "-", "-", "-"))
+print("%-40s%9.4f%13.4f%10.3f%9.4f%10.1f%10.2f" % ("Bayes última capa (HMC-MLX)", mlx_rmse, mlx_ll, mlx_cov, mlx_crps, steps_per_sec_last, grads_per_step_last))
+print("%-40s%9.4f%13.4f%10.3f%9.4f%10.1f%10.2f" % ("Bayes red completa (HMC-MLX)", mlx_full_rmse, mlx_full_ll, mlx_full_cov, mlx_full_crps, steps_per_sec_full, grads_per_step_full))
 print("(log-lik mayor es mejor; CRPS menor es mejor; cobertura 95% ideal ≈ 0.95)")
-print("Los dos muestreadores bayesianos deben coincidir; ambos calibran mejor que el MAP.")
+print("Nota: la red completa tiene %d parámetros vs %d de la última capa." % (model_ndim_full, model_ndim_last))
 
 
 # ---------------------------------------------------------------------------
-# Gráfica: determinista vs bayesiano (NUTS-MLX vs NUTS-PyMC) en la malla.
+# Gráfica: determinista vs bayesiano (última capa vs red completa) en la malla.
 # ---------------------------------------------------------------------------
 def grid_post_mean(samples):
     phi_g = np.asarray(phi_grid)
@@ -358,20 +470,28 @@ def grid_post_mean(samples):
     return mus.mean(axis=0), np.percentile(mus, 2.5, axis=0), np.percentile(mus, 97.5, axis=0)
 
 
+def grid_post_mean_full(samples, sizes):
+    Xgrid_np = np.asarray(Xgrid)
+    mus = np.array([predict_full_network_np(flat, Xgrid_np, sizes)[0] for flat in samples]) * y_sd + y_mean
+    return mus.mean(axis=0), np.percentile(mus, 2.5, axis=0), np.percentile(mus, 97.5, axis=0)
+
+
 det_grid = head_np(np.asarray(flat0), np.asarray(phi_grid))[0] * y_sd + y_mean
 mlx_mean, mlx_lo, mlx_hi = grid_post_mean(samples_mlx)
-pm_mean, _, _ = grid_post_mean(samples_pm)
+mlx_full_mean, mlx_full_lo, mlx_full_hi = grid_post_mean_full(samples_mlx_full, sizes_full)
 
 plt.figure(figsize=(8, 5))
 plt.scatter(X_train, y_train, s=8, alpha=0.2, color="gray", label="datos")
 plt.plot(xx, f(xx), "k--", label="media verdadera")
 plt.plot(xx, det_grid, "C1", label="MLP determinista (MAP)")
-plt.plot(xx, mlx_mean, "C0", label="Bayes última capa (NUTS-MLX)")
-plt.plot(xx, pm_mean, "C2", lw=1, ls=":", label="Bayes última capa (NUTS-PyMC)")
-plt.fill_between(xx.ravel(), mlx_lo, mlx_hi, color="C0", alpha=0.2,
-                 label="IC 95% (incertidumbre epistémica, MLX)")
+plt.plot(xx, mlx_mean, "C0", ls="--", lw=1.5, label="Bayes última capa (HMC-MLX)")
+plt.plot(xx, mlx_full_mean, "C3", label="Bayes red completa (HMC-MLX)")
+plt.fill_between(xx.ravel(), mlx_lo, mlx_hi, color="C0", alpha=0.15,
+                 label="IC 95% (última capa)")
+plt.fill_between(xx.ravel(), mlx_full_lo, mlx_full_hi, color="C3", alpha=0.15,
+                 label="IC 95% (red completa)")
 plt.legend()
-plt.title("Determinista (SGD/MAP) vs Bayesiano de última capa — t-Student")
+plt.title("Determinista (MAP) vs Bayesiano: última capa vs red completa — HMC-MLX")
 plt.tight_layout()
 plt.savefig("bayesian_neural_net.png", dpi=120)
 print("\nGráfica guardada en bayesian_neural_net.png")
