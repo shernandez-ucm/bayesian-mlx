@@ -42,7 +42,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx.utils import tree_map
+import mlx.optimizers as optim
 
 from blmx import sample_hmc_chains, sample_nuts_chains
 
@@ -129,25 +129,33 @@ def train_test_split(X, y, test_size=0.3, random_state=0):
 
 
 # ---------------------------------------------------------------------------
-# MLP funcional (lista de pares (W, b)); compatible con el bucle SGD de abajo.
+# MLP determinista, como ``nn.Module`` de MLX (capas ``nn.Linear``).
+#
+# Solo esta fase (1: entrenamiento SGD del MAP) usa el módulo directamente.
+# El resto del script (última capa / red completa bayesianas, previa
+# horseshoe) sigue operando sobre la representación funcional -- una lista de
+# pares (W, b) con convención ``x @ W + b`` (W de forma (din, dout)) -- que ya
+# tenían todas las funciones de más abajo (``mlp_features``, ``hs_reconstruct``,
+# etc.); ``module_to_params`` hace la conversión una sola vez tras entrenar
+# (nn.Linear guarda su peso transpuesto, (dout, din), estilo PyTorch).
 # ---------------------------------------------------------------------------
-def init_mlp(key, sizes):
-    """Inicializa los parámetros de un MLP con inicialización tipo He."""
-    params = []
-    keys = mx.random.split(key, len(sizes) - 1)
-    for k, din, dout in zip(keys, sizes[:-1], sizes[1:]):
-        W = mx.random.normal((din, dout), key=k) * np.sqrt(2.0 / din)
-        b = mx.zeros((dout,))
-        params.append([W, b])
-    return params
+class MLP(nn.Module):
+    """MLP con capas ReLU ocultas y salida lineal (cabeza t-Student)."""
+
+    def __init__(self, sizes):
+        super().__init__()
+        self.layers = [nn.Linear(din, dout) for din, dout in zip(sizes[:-1], sizes[1:])]
+
+    def __call__(self, x):
+        for layer in self.layers[:-1]:
+            x = nn.relu(layer(x))
+        return self.layers[-1](x)
 
 
-def mlp_forward(params, x):
-    """Pasada hacia adelante: capas ReLU ocultas y salida lineal."""
-    for W, b in params[:-1]:
-        x = nn.relu(x @ W + b)
-    W, b = params[-1]
-    return x @ W + b
+def module_to_params(model):
+    """``MLP`` entrenado -> lista de pares (W, b) con convención ``x @ W + b``
+    (transpone el peso de cada ``nn.Linear``, guardado como (dout, din))."""
+    return [[layer.weight.T, layer.bias] for layer in model.layers]
 
 
 def mlp_features(body_params, x):
@@ -165,24 +173,24 @@ def predict_params(out):
     return mu, sigma, nu
 
 
-def tstudent_loss(params, x, y):
+def tstudent_loss(model, x, y):
     """NLL de una t de Student (location-scale) con cabeza heterocedástica."""
-    mu, sigma, nu = predict_params(mlp_forward(params, x))
+    mu, sigma, nu = predict_params(model(x))
     return -mx.mean(tstudent_logpdf(y, mu, sigma, nu))
 
 
-def train(loss_fn, params, X, y, n_epochs=4000, lr=1e-2, momentum=0.9, log_every=2000):
-    """Entrena `params` minimizando `loss_fn(params, X, y)` con SGD (momentum)."""
-    velocity = tree_map(lambda p: mx.zeros_like(p), params)
-    loss_and_grad = mx.value_and_grad(loss_fn)
+def train(model, loss_fn, X, y, n_epochs=4000, lr=1e-2, momentum=0.9, log_every=2000):
+    """Entrena `model` (nn.Module) minimizando `loss_fn(model, X, y)`, con
+    SGD (momentum) de ``mlx.optimizers``."""
+    optimizer = optim.SGD(learning_rate=lr, momentum=momentum)
+    loss_and_grad = nn.value_and_grad(model, loss_fn)
     for epoch in range(1, n_epochs + 1):
-        loss, grads = loss_and_grad(params, X, y)
-        velocity = tree_map(lambda v, g: momentum * v + g, velocity, grads)
-        params = tree_map(lambda p, v: p - lr * v, params, velocity)
-        mx.eval(params, velocity)
+        loss, grads = loss_and_grad(model, X, y)
+        optimizer.update(model, grads)
+        mx.eval(model.parameters(), optimizer.state)
         if epoch % log_every == 0 or epoch == 1:
             print("  época %5d  |  pérdida = %.4f" % (epoch, loss.item()))
-    return params
+    return model
 
 
 def param_sizes(params):
@@ -324,11 +332,11 @@ Xgrid = mx.array(standardize_X(xx).astype(np.float32))
 # ---------------------------------------------------------------------------
 # 1) Entrenamiento del MLP determinista (SGD) con verosimilitud t-Student.
 # ---------------------------------------------------------------------------
-key = mx.random.key(RANDOM_STATE)
-key, k_init = mx.random.split(key)
-params = init_mlp(k_init, [1, 64, 64, 3])
+mx.random.seed(RANDOM_STATE)  # nn.Linear no toma una key explícita; usa el estado global
+model = MLP([1, 64, 64, 3])
 print("\nEntrenando MLP con pérdida t-Student (SGD)...")
-params = train(tstudent_loss, params, Xtr, ytr, n_epochs=20000, lr=1e-2)
+model = train(model, tstudent_loss, Xtr, ytr, n_epochs=20000, lr=1e-2)
+params = module_to_params(model)
 SIZES_FULL = param_sizes(params)  # [1, 64, 64, 3]
 shapes_full = list(zip(SIZES_FULL[:-1], SIZES_FULL[1:]))  # [(1,64), (64,64), (64,3)]
 
